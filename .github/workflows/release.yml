@@ -1,0 +1,89 @@
+name: Release
+
+# Manually triggered: builds the static site and publishes a GitHub Release
+# with a zip of `dist/` ready to upload to any static host (Netlify, S3,
+# Cloudflare Pages, nginx, …). Run it from Actions → Release → "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.0). Leave empty for v<package.json version>-<run number>.'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # Optional analytics / sourcemap upload: set these as repo
+      # variables/secrets to bake them into the build. All are optional —
+      # the build succeeds without them.
+      - name: Build
+        run: npm run build
+        env:
+          VITE_POSTHOG_KEY: ${{ vars.VITE_POSTHOG_KEY }}
+          VITE_POSTHOG_HOST: ${{ vars.VITE_POSTHOG_HOST }}
+          POSTHOG_CLI_API_KEY: ${{ secrets.POSTHOG_CLI_API_KEY }}
+          POSTHOG_CLI_PROJECT_ID: ${{ vars.POSTHOG_CLI_PROJECT_ID }}
+          POSTHOG_CLI_HOST: ${{ vars.POSTHOG_CLI_HOST }}
+
+      - name: Resolve tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag="v$(node -p "require('./package.json').version")-${GITHUB_RUN_NUMBER}"
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "zip=midee-$tag.zip" >> "$GITHUB_OUTPUT"
+
+      # Zip the *contents* of dist/ (so index.html sits at the zip root).
+      # Source maps are excluded — vite emits them as `hidden` for PostHog
+      # upload only; they shouldn't be served publicly.
+      - name: Package
+        run: |
+          cd dist
+          zip -r -q "../${{ steps.meta.outputs.zip }}" . -x '*.map'
+          cd ..
+          ls -lh "${{ steps.meta.outputs.zip }}"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "$ZIP" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes \
+            "${flags[@]}"
